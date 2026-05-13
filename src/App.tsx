@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react';
-import { supabase } from './lib/supabase';
+import { useState, useEffect, useMemo } from 'react';
+import { supabase, supabaseAdmin } from './lib/supabase';
 import { PROVINCES, CLIMATE_ZONES, BUILDING_TYPES, MONTHS, AC_TYPES, extractProvinceCity, getClimateZoneByCity, getClimateZoneByProvince } from './lib/supabase';
-import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, AreaChart, Area } from 'recharts';
+import { setCache, getCache, clearCache } from './utils/cache';
+import { BarChart, Bar, LineChart, Line, PieChart, Pie, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, ComposedChart } from 'recharts';
 import { User, LogOut, Plus, Calculator, Building2, Zap, Snowflake, Lightbulb, ArrowUpDown, Home, FileText, BarChart3, UserCircle, ChevronRight, TrendingUp, TrendingDown, Award, Target, Leaf, Save, Pencil, Trash2 } from 'lucide-react';
 import './App.css';
 
@@ -23,6 +24,7 @@ interface Project {
   building_type: string;
   building_area: number;
   climate_zone: string;
+  ac_mode?: string;
   ac_type?: string;
   cooling_months?: number[];
   heating_months?: number[];
@@ -36,12 +38,68 @@ interface MonthlyData {
   unit: string;
 }
 
+interface ScopEquipment {
+  id: string;
+  name: string;
+  ratedPower: number;
+  frequency: number;
+}
+
+interface ScopLoadSegment {
+  coolingLoad: number;
+  chillerCount: number;
+  chillers: ScopEquipment[];
+  chilledPump: { ratedPower: number; frequency: number };
+  coolingPump: { ratedPower: number; frequency: number };
+  coolingTower: { ratedPower: number; frequency: number };
+}
+
+interface ScopData {
+  lowLoad: ScopLoadSegment;
+  highLoad: ScopLoadSegment;
+}
+
+interface Project {
+  id: string;
+  user_id: string;
+  project_name: string;
+  province: string;
+  city?: string;
+  building_type: string;
+  building_area: number;
+  climate_zone: string;
+  ac_mode?: string;
+  ac_type?: string;
+  cooling_months?: number[];
+  heating_months?: number[];
+  is_public: boolean;
+  created_at?: string;
+  scop_data?: ScopData;
+}
+
 // 分类能耗类型
 interface EnergyCategory {
   name: string;
   value: number;
   icon: string;
   color: string;
+}
+
+// 同类项目统计数据（从数据库计算得出）
+interface PeerStats {
+  count: number;       // 同类项目数量
+  avgEUI: number;      // 同类项目平均EUI
+  minEUI: number;      // 同类项目最低EUI（优秀）
+  maxEUI: number;      // 同类项目最高EUI（较差）
+}
+
+// 空调相关统计数据
+interface ACStats {
+  annualAC_EUI: number;        // 年度空调EUI
+  avgPeerAC_EUI: number;       // 同类项目平均空调EUI
+  bestPeerAC_EUI: number;      // 同类最佳空调EUI
+  energySavingPotential: number; // 节能空间 (%)
+  energySavingAmount: number;   // 节能金额 (万元)
 }
 
 // 市选项（根据省份动态变化）
@@ -129,7 +187,7 @@ const getClimateZoneByCity = (city: string, province: string): string => {
 function App() {
   const [user, setUser] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
-  const [view, setView] = useState<'login' | 'dashboard' | 'project-form' | 'project-detail' | 'analysis'>('login');
+  const [view, setView] = useState<'login' | 'dashboard' | 'project-form' | 'project-detail' | 'analysis' | 'admin'>('login');
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [email, setEmail] = useState('');
@@ -149,7 +207,8 @@ function App() {
   });
 
   // 空调形式和冷热月状态
-  const [acType, setAcType] = useState('水冷冷水机组');
+  const [acMode, setAcMode] = useState<'cooling_only' | 'heating_only' | 'both'>('both'); // 单冷/单热/冷热都有
+  const [acTypes, setAcTypes] = useState<string[]>(['水冷冷水机组']); // 空调形式多选
   const [coolingMonths, setCoolingMonths] = useState<number[]>([5, 6, 7, 8, 9]);
   const [heatingMonths, setHeatingMonths] = useState<number[]>([11, 12, 1, 2, 3]);
 
@@ -177,10 +236,97 @@ function App() {
   // 同类项目月度EUI均值（从数据库查询）
   const [peerMonthlyEUI, setPeerMonthlyEUI] = useState<number[]>([]);
 
+  // 同类最优秀项目的月度EUI（从数据库查询）
+  const [bestPeerMonthlyEUI, setBestPeerMonthlyEUI] = useState<number[]>([]);
+
+  // 同类项目统计数据（从数据库计算）
+  const [peerStats, setPeerStats] = useState<PeerStats>({ count: 0, avgEUI: 0, minEUI: 0, maxEUI: 0 });
+
+  // 空调EUI相关状态
+  const [projectAC_EUIs, setProjectAC_EUIs] = useState<Record<string, number>>({}); // 项目年度空调EUI
+  const [acMonthlyEUI, setAcMonthlyEUI] = useState<number[]>([]); // 空调月度EUI
+  const [acStats, setAcStats] = useState<ACStats>({
+    annualAC_EUI: 0,
+    avgPeerAC_EUI: 0,
+    bestPeerAC_EUI: 0,
+    energySavingPotential: 0,
+    energySavingAmount: 0,
+  });
+
+  // 管理员相关状态
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [adminUsers, setAdminUsers] = useState<Profile[]>([]);
+  const [newUserEmail, setNewUserEmail] = useState('');
+  const [newUserPassword, setNewUserPassword] = useState('');
+  const [resetUserEmail, setResetUserEmail] = useState('');
+  const [resetNewPassword, setResetNewPassword] = useState('');
+  const [adminMessage, setAdminMessage] = useState('');
+  const [adminError, setAdminError] = useState('');
+
+  // SCOP 相关状态
+  const [scopData, setScopData] = useState<ScopData>({
+    lowLoad: {
+      coolingLoad: 0,
+      chillerCount: 1,
+      chillers: [{ id: '1', name: '主机1', ratedPower: 0, frequency: 50 }],
+      chilledPump: { ratedPower: 0, frequency: 50 },
+      coolingPump: { ratedPower: 0, frequency: 50 },
+      coolingTower: { ratedPower: 0, frequency: 50 },
+    },
+    highLoad: {
+      coolingLoad: 0,
+      chillerCount: 1,
+      chillers: [{ id: '1', name: '主机1', ratedPower: 0, frequency: 50 }],
+      chilledPump: { ratedPower: 0, frequency: 50 },
+      coolingPump: { ratedPower: 0, frequency: 50 },
+      coolingTower: { ratedPower: 0, frequency: 50 },
+    },
+  });
+
+  const calculateScop = (segment: ScopLoadSegment): number => {
+    const { coolingLoad, chillers, chilledPump, coolingPump, coolingTower } = segment;
+    if (coolingLoad <= 0) return 0;
+
+    const totalChillerPower = chillers.reduce((sum, c) => sum + c.ratedPower, 0);
+    const chilledPumpPower = chilledPump.ratedPower * Math.pow(chilledPump.frequency / 50, 3) / 0.85;
+    const coolingPumpPower = coolingPump.ratedPower * Math.pow(coolingPump.frequency / 50, 3) / 0.85;
+    const coolingTowerPower = coolingTower.ratedPower * Math.pow(coolingTower.frequency / 50, 3) / 0.85;
+
+    const totalPower = totalChillerPower + chilledPumpPower + coolingPumpPower + coolingTowerPower;
+    if (totalPower <= 0) return 0;
+
+    return coolingLoad / totalPower;
+  };
+
   useEffect(() => {
     checkUser();
     loadBenchmarks();
   }, []);
+
+  // 当选择的项目变化时，加载同类项目数据
+  useEffect(() => {
+    if (selectedProject && view === 'project-detail') {
+      loadPeerStats(selectedProject);
+      loadPeerMonthlyEUI(selectedProject);
+      loadACStats(selectedProject);
+    }
+  }, [selectedProject?.id, view]);
+
+  // 使用useMemo计算同类均值月度数据（确保在peerMonthlyEUI更新后重新计算）
+  const peerMonthlyData = useMemo(() => {
+    if (!peerMonthlyEUI || peerMonthlyEUI.length === 0) {
+      return [];
+    }
+    return peerMonthlyEUI;
+  }, [peerMonthlyEUI]);
+
+  // 使用useMemo计算同类最佳项目月度数据
+  const bestPeerMonthlyData = useMemo(() => {
+    if (!bestPeerMonthlyEUI || bestPeerMonthlyEUI.length === 0) {
+      return [];
+    }
+    return bestPeerMonthlyEUI;
+  }, [bestPeerMonthlyEUI]);
 
   const checkUser = async () => {
     try {
@@ -201,6 +347,9 @@ function App() {
       const { data } = await supabase.from('profiles').select('*').eq('id', userId).single();
       if (data) {
         setUser(data);
+        // 检查是否为管理员
+        const adminEmail = 'fwing86@qq.com';
+        setIsAdmin(data.email === adminEmail);
       } else {
         const { data: newProfile } = await supabase.from('profiles').insert({
           id: userId,
@@ -220,21 +369,185 @@ function App() {
     }
   };
 
+  // 管理员：创建用户
+  const adminCreateUser = async () => {
+    setAdminMessage('');
+    setAdminError('');
+
+    if (!newUserEmail || !newUserPassword) {
+      setAdminError('请填写邮箱和密码');
+      return;
+    }
+
+    if (newUserPassword.length < 6) {
+      setAdminError('密码至少需要6位');
+      return;
+    }
+
+    try {
+      // 使用服务角色客户端创建用户
+      const { data, error } = await supabaseAdmin.auth.admin.createUser({
+        email: newUserEmail,
+        password: newUserPassword,
+        email_confirm: true,
+      });
+
+      if (error) {
+        setAdminError(error.message || '创建用户失败');
+        return;
+      }
+
+      // 创建 profiles 记录
+      if (data.user) {
+        await supabase.from('profiles').insert({
+          id: data.user.id,
+          email: newUserEmail,
+        });
+      }
+
+      setAdminMessage(`用户 ${newUserEmail} 创建成功！`);
+      setNewUserEmail('');
+      setNewUserPassword('');
+      loadAdminUsers();
+    } catch (err: any) {
+      console.error('创建用户失败:', err);
+      setAdminError(err.message || '创建用户失败');
+    }
+  };
+
+  // 管理员：重置用户密码
+  const adminResetPassword = async () => {
+    setAdminMessage('');
+    setAdminError('');
+
+    if (!resetUserEmail || !resetNewPassword) {
+      setAdminError('请填写邮箱和新密码');
+      return;
+    }
+
+    if (resetNewPassword.length < 6) {
+      setAdminError('新密码至少需要6位');
+      return;
+    }
+
+    try {
+      // 查找用户
+      const { data: userData, error: userError } = await supabase
+        .from('profiles')
+        .select('id')
+        .eq('email', resetUserEmail)
+        .single();
+
+      if (userError || !userData) {
+        setAdminError('用户不存在');
+        return;
+      }
+
+      // 使用服务角色客户端更新密码
+      const { error: updateError } = await supabaseAdmin.auth.admin.updateUserById(
+        userData.id,
+        { password: resetNewPassword }
+      );
+
+      if (updateError) {
+        setAdminError(updateError.message || '重置密码失败');
+        return;
+      }
+
+      setAdminMessage(`用户 ${resetUserEmail} 的密码已重置！`);
+      setResetUserEmail('');
+      setResetNewPassword('');
+    } catch (err: any) {
+      console.error('重置密码失败:', err);
+      setAdminError(err.message || '重置密码失败');
+    }
+  };
+
+  // 管理员：加载用户列表
+  const loadAdminUsers = async () => {
+    try {
+      const { data } = await supabase.from('profiles').select('*').order('email');
+      if (data) {
+        setAdminUsers(data);
+      }
+    } catch (err) {
+      console.error('加载用户列表失败:', err);
+    }
+  };
+
   const loadProjects = async () => {
     const { data: { user: authUser } } = await supabase.auth.getUser();
     if (!authUser) return;
-    const { data } = await supabase.from('projects').select('*').eq('user_id', authUser.id).order('created_at', { ascending: false });
-    if (data) setProjects(data);
 
-    // 加载所有项目的EUI
+    // 尝试从缓存读取
+    const cachedProjects = getCache<Project[]>('projects', authUser.id);
+    const cachedEUIs = getCache<Record<string, number>>('project_euis', authUser.id);
+
+    // 加载项目列表
+    const { data } = await supabase.from('projects').select('*').eq('user_id', authUser.id).order('created_at', { ascending: false });
+    if (data) {
+      setProjects(data);
+      // 更新缓存
+      setCache('projects', data, authUser.id);
+    }
+
+    // 优先从缓存读取 EUI 数据（快速显示）
+    if (cachedEUIs && Object.keys(cachedEUIs).length > 0) {
+      setProjectEUIs(cachedEUIs);
+    }
+
+    // 后台加载 EUI 数据并更新缓存
     const euiMap: Record<string, number> = {};
-    for (const project of data) {
-      const { data: energyData } = await supabase.from('annual_energy').select('month_1,month_2,month_3,month_4,month_5,month_6,month_7,month_8,month_9,month_10,month_11,month_12').eq('project_id', project.id).order('year', { ascending: true }).limit(1).single();
-      if (energyData && project.building_area > 0) {
-        const total = (energyData.month_1 || 0) + (energyData.month_2 || 0) + (energyData.month_3 || 0) + (energyData.month_4 || 0) + (energyData.month_5 || 0) + (energyData.month_6 || 0) + (energyData.month_7 || 0) + (energyData.month_8 || 0) + (energyData.month_9 || 0) + (energyData.month_10 || 0) + (energyData.month_11 || 0) + (energyData.month_12 || 0);
-        euiMap[project.id] = total / project.building_area;
+
+    for (const project of data || []) {
+      // 尝试读取预存的 annual_eui
+      const { data: energyData, error } = await supabase
+        .from('annual_energy')
+        .select('annual_eui, year, month_1, month_2, month_3, month_4, month_5, month_6, month_7, month_8, month_9, month_10, month_11, month_12')
+        .eq('project_id', project.id)
+        .order('year', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) {
+        // 如果是列不存在错误，从月度数据计算
+        if (error.message.includes('annual_eui') || error.message.includes('does not exist')) {
+          const { data: fallbackData } = await supabase
+            .from('annual_energy')
+            .select('year, month_1, month_2, month_3, month_4, month_5, month_6, month_7, month_8, month_9, month_10, month_11, month_12')
+            .eq('project_id', project.id)
+            .order('year', { ascending: false })
+            .limit(1)
+            .maybeSingle();
+
+          if (fallbackData && project.building_area > 0) {
+            const months = ['month_1', 'month_2', 'month_3', 'month_4', 'month_5', 'month_6',
+                           'month_7', 'month_8', 'month_9', 'month_10', 'month_11', 'month_12'];
+            const totalEnergy = months.reduce((sum, m) => sum + ((fallbackData as any)[m] || 0), 0);
+            const eui = totalEnergy / project.building_area;
+            if (eui > 0) euiMap[project.id] = Math.round(eui * 100) / 100;
+          }
+        }
+        continue;
+      }
+
+      if (energyData) {
+        // 优先使用预存的 annual_eui
+        if (energyData.annual_eui && energyData.annual_eui > 0) {
+          euiMap[project.id] = energyData.annual_eui;
+        } else if (project.building_area > 0) {
+          // 如果预存值为0或null，从月度数据计算
+          const months = ['month_1', 'month_2', 'month_3', 'month_4', 'month_5', 'month_6',
+                         'month_7', 'month_8', 'month_9', 'month_10', 'month_11', 'month_12'];
+          const totalEnergy = months.reduce((sum, m) => sum + ((energyData as any)[m] || 0), 0);
+          const eui = totalEnergy / project.building_area;
+          if (eui > 0) euiMap[project.id] = Math.round(eui * 100) / 100;
+        }
       }
     }
+
+    // 更新 EUI 缓存
+    setCache('project_euis', euiMap, authUser.id);
     setProjectEUIs(euiMap);
   };
 
@@ -243,19 +556,405 @@ function App() {
     if (data) setBenchmarks(data);
   };
 
+  // 加载同类项目的统计数据（从数据库计算）
+  const loadPeerStats = async (project: Project) => {
+    try {
+      // 查询同类项目（同一业态且is_public=true，排除当前项目）
+      const { data: peerProjects, error: peerError } = await supabase
+        .from('projects')
+        .select('*')
+        .eq('building_type', project.building_type)
+        .eq('is_public', true)
+        .neq('id', project.id);
+
+      if (peerError) {
+        console.error('查询同类项目失败:', peerError);
+        const benchmark = getMatchingBenchmark(project);
+        setPeerStats({
+          count: 0,
+          avgEUI: benchmark?.standard_eui || 80,
+          minEUI: benchmark?.min_eui || 60,
+          maxEUI: benchmark?.max_eui || 120,
+        });
+        return;
+      }
+
+      if (!peerProjects || peerProjects.length === 0) {
+        // 没有同类项目时，使用benchmark数据作为兜底
+        const benchmark = getMatchingBenchmark(project);
+        setPeerStats({
+          count: 0,
+          avgEUI: benchmark?.standard_eui || 80,
+          minEUI: benchmark?.min_eui || 60,
+          maxEUI: benchmark?.max_eui || 120,
+        });
+        return;
+      }
+
+      // 收集同类项目的 EUI 数据
+      const peerEUIList: { eui: number; buildingArea: number }[] = [];
+
+      for (const p of peerProjects) {
+        // 获取该项目的年度能耗数据
+        const { data: energyData, error: energyError } = await supabase
+          .from('annual_energy')
+          .select('year, month_1, month_2, month_3, month_4, month_5, month_6, month_7, month_8, month_9, month_10, month_11, month_12')
+          .eq('project_id', p.id)
+          .order('year', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (energyError) {
+          console.error('获取能耗数据失败:', energyError);
+          continue;
+        }
+
+        if (energyData && p.building_area > 0) {
+          // 计算年度总能耗
+          const months = ['month_1', 'month_2', 'month_3', 'month_4', 'month_5', 'month_6',
+                         'month_7', 'month_8', 'month_9', 'month_10', 'month_11', 'month_12'];
+          const totalEnergy = months.reduce((sum, m) => sum + ((energyData as any)[m] || 0), 0);
+          const eui = totalEnergy / p.building_area;
+
+          if (eui > 0) {
+            peerEUIList.push({ eui, buildingArea: p.building_area });
+          }
+        }
+      }
+
+      if (peerEUIList.length === 0) {
+        // 无法计算时使用benchmark兜底
+        const benchmark = getMatchingBenchmark(project);
+        setPeerStats({
+          count: peerProjects.length,
+          avgEUI: benchmark?.standard_eui || 80,
+          minEUI: benchmark?.min_eui || 60,
+          maxEUI: benchmark?.max_eui || 120,
+        });
+      } else {
+        // 计算统计数据
+        const euis = peerEUIList.map(p => p.eui);
+        const avg = euis.reduce((s, e) => s + e, 0) / euis.length;
+        const sorted = [...euis].sort((a, b) => a - b);
+        setPeerStats({
+          count: peerProjects.length,
+          avgEUI: Math.round(avg * 100) / 100,
+          minEUI: sorted[0],
+          maxEUI: sorted[sorted.length - 1],
+        });
+      }
+    } catch (err) {
+      console.error('loadPeerStats 出错:', err);
+      const benchmark = getMatchingBenchmark(project);
+      setPeerStats({
+        count: 0,
+        avgEUI: benchmark?.standard_eui || 80,
+        minEUI: benchmark?.min_eui || 60,
+        maxEUI: benchmark?.max_eui || 120,
+      });
+    }
+  };
+
+  // 加载同类项目的月度EUI均值和最佳项目数据
+  const loadPeerMonthlyEUI = async (project: Project) => {
+    try {
+      // 查询同类项目，使用原始building_type
+      const { data: peerProjects, error: peerError } = await supabase
+        .from('projects')
+        .select('*')
+        .eq('building_type', project.building_type)
+        .eq('is_public', true)
+        .neq('id', project.id);
+
+      if (peerError) {
+        console.error('查询同类项目失败:', peerError);
+        setPeerMonthlyEUI([]);
+        setBestPeerMonthlyEUI([]);
+        return;
+      }
+
+      if (!peerProjects || peerProjects.length === 0) {
+        setPeerMonthlyEUI([]);
+        setBestPeerMonthlyEUI([]);
+        return;
+      }
+
+      // 收集每个月的EUI数据（从月度能耗和building_area计算）
+      const monthlyEUIs: number[][] = Array.from({ length: 12 }, () => []);
+      // 存储每个项目的年度EUI用于找最佳项目
+      const peerAnnualEUIList: { projectId: string; annualEUI: number; buildingArea: number }[] = [];
+
+      for (const p of peerProjects) {
+        const { data: energyData, error: energyError } = await supabase
+          .from('annual_energy')
+          .select('month_1,month_2,month_3,month_4,month_5,month_6,month_7,month_8,month_9,month_10,month_11,month_12')
+          .eq('project_id', p.id)
+          .order('year', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (energyError) {
+          console.error('获取能耗数据失败:', energyError);
+          continue;
+        }
+
+        if (energyData && p.building_area > 0) {
+          let annualTotal = 0;
+          for (let m = 0; m < 12; m++) {
+            const monthEnergy = energyData[`month_${m + 1}` as keyof typeof energyData] as number || 0;
+            annualTotal += monthEnergy;
+            const monthEUI = monthEnergy / p.building_area;
+            if (monthEUI > 0) {
+              monthlyEUIs[m].push(monthEUI);
+            }
+          }
+          const annualEUI = annualTotal / p.building_area;
+          peerAnnualEUIList.push({ projectId: p.id, annualEUI, buildingArea: p.building_area });
+        }
+      }
+
+      // 计算每个月的平均EUI
+      const monthlyAvg = monthlyEUIs.map(euis => {
+        if (euis.length === 0) return 0;
+        return Math.round((euis.reduce((s, e) => s + e, 0) / euis.length) * 100) / 100;
+      });
+
+      setPeerMonthlyEUI(monthlyAvg);
+
+      // 找出年度EUI最低的最佳项目
+      if (peerAnnualEUIList.length > 0) {
+        const bestPeer = peerAnnualEUIList.reduce((min, curr) =>
+          curr.annualEUI < min.annualEUI ? curr : min
+        );
+
+        // 加载最佳项目的月度EUI数据
+        const { data: bestEnergyData, error: bestError } = await supabase
+          .from('annual_energy')
+          .select('month_1,month_2,month_3,month_4,month_5,month_6,month_7,month_8,month_9,month_10,month_11,month_12')
+          .eq('project_id', bestPeer.projectId)
+          .order('year', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (bestError) {
+          console.error('获取最佳项目数据失败:', bestError);
+          setBestPeerMonthlyEUI([]);
+        } else if (bestEnergyData && bestPeer.buildingArea > 0) {
+          const bestMonthlyEUI = Array(12).fill(0).map((_, m) => {
+            const monthEnergy = bestEnergyData[`month_${m + 1}` as keyof typeof bestEnergyData] as number || 0;
+            return Math.round((monthEnergy / bestPeer.buildingArea) * 100) / 100;
+          });
+          setBestPeerMonthlyEUI(bestMonthlyEUI);
+        } else {
+          setBestPeerMonthlyEUI([]);
+        }
+      } else {
+        setBestPeerMonthlyEUI([]);
+      }
+    } catch (err) {
+      console.error('loadPeerMonthlyEUI 出错:', err);
+      setPeerMonthlyEUI([]);
+      setBestPeerMonthlyEUI([]);
+    }
+  };
+
+  // 加载空调EUI相关统计数据
+  // 基准能耗 = 非冷热月的能耗平均值
+  // 月度空调EUI = (月度能耗 - 基准能耗) / 建筑面积
+  // 年度空调EUI = 12个月月度空调EUI之和
+  const loadACStats = async (project: Project) => {
+    try {
+      // 获取项目的年度能耗数据
+      const { data: energyData } = await supabase
+        .from('annual_energy')
+        .select('year, month_1, month_2, month_3, month_4, month_5, month_6, month_7, month_8, month_9, month_10, month_11, month_12')
+        .eq('project_id', project.id)
+        .order('year', { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (!energyData || project.building_area <= 0) {
+        setAcMonthlyEUI(Array(12).fill(0));
+        setAcStats({
+          annualAC_EUI: 0,
+          avgPeerAC_EUI: 0,
+          bestPeerAC_EUI: 0,
+          energySavingPotential: 0,
+          energySavingAmount: 0,
+        });
+        return;
+      }
+
+      const months = ['month_1', 'month_2', 'month_3', 'month_4', 'month_5', 'month_6',
+                      'month_7', 'month_8', 'month_9', 'month_10', 'month_11', 'month_12'];
+
+      // 获取月度能耗数据
+      const monthlyEnergies: number[] = [];
+      for (let m = 0; m < 12; m++) {
+        monthlyEnergies.push((energyData as any)[months[m]] || 0);
+      }
+
+      // 获取所有冷热月
+      const allACMonths = new Set([...(project.cooling_months || []), ...(project.heating_months || [])]);
+
+      // 计算非冷热月的能耗值
+      const nonACMonthValues = monthlyEnergies.filter((_, i) => !allACMonths.has(i + 1));
+
+      // 计算基准能耗（剔除冷热月后的月均能耗）
+      const avgNonAC = nonACMonthValues.length > 0
+        ? nonACMonthValues.reduce((s, v) => s + v, 0) / nonACMonthValues.length
+        : 0;
+
+      // 计算月度空调EUI：月度空调能耗 / 建筑面积
+      const acMonthlyEUIList: number[] = [];
+      let annualACEnergy = 0;
+      let annualTotal = 0;
+
+      for (let m = 0; m < 12; m++) {
+        const monthEnergy = monthlyEnergies[m];
+        annualTotal += monthEnergy;
+        // 月度空调能耗 = max(0, 月度能耗 - 基准能耗)
+        const monthACEnergy = Math.max(0, monthEnergy - avgNonAC);
+        annualACEnergy += monthACEnergy;
+        // 月度空调EUI
+        const acEUI = monthACEnergy / project.building_area;
+        acMonthlyEUIList.push(Math.round(acEUI * 100) / 100);
+      }
+
+      setAcMonthlyEUI(acMonthlyEUIList);
+
+      // 年度空调EUI = 12个月月度空调EUI之和
+      const annualAC_EUI = acMonthlyEUIList.reduce((sum, e) => sum + e, 0);
+      const annualAC_EUIRounded = Math.round(annualAC_EUI * 100) / 100;
+
+      // 查询同类项目
+      const { data: peerProjects } = await supabase
+        .from('projects')
+        .select('*')
+        .eq('building_type', project.building_type)
+        .eq('is_public', true)
+        .neq('id', project.id);
+
+      // 计算同类项目的空调EUI
+      const peerAC_EUIs: number[] = [];
+      let bestPeerAC_EUI = 0;
+
+      for (const p of peerProjects || []) {
+        const { data: pEnergy } = await supabase
+          .from('annual_energy')
+          .select('month_1, month_2, month_3, month_4, month_5, month_6, month_7, month_8, month_9, month_10, month_11, month_12')
+          .eq('project_id', p.id)
+          .order('year', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+
+        if (pEnergy && p.building_area > 0) {
+          const pMonthlyEnergies: number[] = [];
+          for (const m of months) {
+            pMonthlyEnergies.push((pEnergy as any)[m] || 0);
+          }
+
+          // 计算同类项目的基准能耗
+          const pACMonths = new Set([...(p.cooling_months || []), ...(p.heating_months || [])]);
+          const pNonACValues = pMonthlyEnergies.filter((_, i) => !pACMonths.has(i + 1));
+          const pAvgNonAC = pNonACValues.length > 0
+            ? pNonACValues.reduce((s, v) => s + v, 0) / pNonACValues.length
+            : 0;
+
+          // 计算同类项目的月度空调EUI
+          let pAnnualAC_EUI = 0;
+          for (let m = 0; m < 12; m++) {
+            const pMonthACEnergy = Math.max(0, pMonthlyEnergies[m] - pAvgNonAC);
+            pAnnualAC_EUI += pMonthACEnergy / p.building_area;
+          }
+
+          if (pAnnualAC_EUI > 0) {
+            peerAC_EUIs.push(pAnnualAC_EUI);
+            if (bestPeerAC_EUI === 0 || pAnnualAC_EUI < bestPeerAC_EUI) {
+              bestPeerAC_EUI = pAnnualAC_EUI;
+            }
+          }
+        }
+      }
+
+      // 计算平均空调EUI
+      const avgPeerAC_EUI = peerAC_EUIs.length > 0
+        ? Math.round((peerAC_EUIs.reduce((s, e) => s + e, 0) / peerAC_EUIs.length) * 100) / 100
+        : annualAC_EUIRounded * 0.45; // 使用行业估算值
+
+      // 计算节能空间
+      let energySavingPotential = 0;
+      if (avgPeerAC_EUI > 0 && annualAC_EUIRounded > avgPeerAC_EUI) {
+        energySavingPotential = Math.round(((annualAC_EUIRounded - avgPeerAC_EUI) / annualAC_EUIRounded) * 100);
+      } else if (bestPeerAC_EUI > 0 && annualAC_EUIRounded > bestPeerAC_EUI) {
+        energySavingPotential = Math.round(((annualAC_EUIRounded - bestPeerAC_EUI) / annualAC_EUIRounded) * 100);
+      }
+
+      // 计算节能金额（万元）
+      // 假设电价1元/kWh，年空调能耗 * 节能比例
+      const energySavingAmount = annualACEnergy * (energySavingPotential / 100) / 10000;
+
+      setAcStats({
+        annualAC_EUI: annualAC_EUIRounded,
+        avgPeerAC_EUI,
+        bestPeerAC_EUI: Math.round(bestPeerAC_EUI * 100) / 100,
+        energySavingPotential,
+        energySavingAmount: Math.round(energySavingAmount * 100) / 100,
+      });
+    } catch (err) {
+      console.error('loadACStats 出错:', err);
+      setAcMonthlyEUI(Array(12).fill(0));
+      setAcStats({
+        annualAC_EUI: 0,
+        avgPeerAC_EUI: 0,
+        bestPeerAC_EUI: 0,
+        energySavingPotential: 0,
+        energySavingAmount: 0,
+      });
+    }
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
+
+    // 密码长度验证
+    if (password.length < 6) {
+      setAuthError('密码至少需要6位');
+      return;
+    }
+
+    // 先尝试登录
     const { error: loginError } = await supabase.auth.signInWithPassword({ email, password });
+
     if (loginError) {
-      const { data, error: signUpError } = await supabase.auth.signUp({ email, password });
-      if (signUpError) {
-        setAuthError(signUpError.message);
-      } else if (data.user) {
-        await supabase.from('profiles').insert({ id: data.user.id, email });
-        loadProfile(data.user.id);
+      // 登录失败，可能是用户不存在，尝试注册
+      if (loginError.message.includes('Invalid') || loginError.message.includes('invalid')) {
+        const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
+          email,
+          password,
+        });
+
+        if (signUpError) {
+          setAuthError(signUpError.message);
+        } else if (signUpData.user) {
+          // 注册成功，创建 profiles 记录
+          try {
+            await supabase.from('profiles').insert({
+              id: signUpData.user.id,
+              email: email,
+            });
+          } catch (err) {
+            console.error('创建profiles失败:', err);
+          }
+          loadProfile(signUpData.user.id);
+        }
+      } else {
+        // 其他登录错误（密码错误等）
+        setAuthError(loginError.message);
       }
     } else {
+      // 登录成功
       const { data: { user: authUser } } = await supabase.auth.getUser();
       if (authUser) loadProfile(authUser.id);
     }
@@ -341,8 +1040,9 @@ function App() {
         dataPoint[key] = buildingArea > 0 ? Math.round((monthlyEnergy / buildingArea) * 100) / 100 : 0;
       });
 
-      // 折线图：同类均值留空，等待异步数据填充
-      dataPoint['同类均值'] = 0;
+      // 折线图：同类均值和最佳留null（null表示不绘制此点）
+      dataPoint['同类均值'] = null;
+      dataPoint['同类最佳'] = null;
 
       return dataPoint;
     });
@@ -412,10 +1112,12 @@ function App() {
       building_type: projectForm.building_type,
       climate_zone: projectForm.climate_zone,
       building_area: projectForm.building_area,
-      ac_type: acType,
+      ac_mode: acMode,
+      ac_type: acTypes.join(','),
       cooling_months: coolingMonths,
       heating_months: heatingMonths,
       is_public: projectForm.is_public,
+      scop_data: scopData as any,
     }).select().single();
 
     if (error) {
@@ -428,6 +1130,30 @@ function App() {
       const hasData = data.months.some(m => m > 0);
       if (!hasData) return Promise.resolve();
 
+      // 计算年度总能耗
+      const totalEnergy = data.months.reduce((sum, m) => sum + (m || 0), 0);
+      // 计算年度 EUI = 总能耗 / 建筑面积
+      const annualEUI = projectForm.building_area > 0 ? Math.round((totalEnergy / projectForm.building_area) * 100) / 100 : null;
+
+      // 计算月度空调EUI（与loadACStats一致的算法）
+      // 基准能耗 = 非冷热月的能耗平均值
+      // 月度空调EUI = max(0, 月度能耗 - 基准能耗) / 建筑面积
+      const allACMonths = new Set([...coolingMonths, ...heatingMonths]);
+      const nonACMonthValues = data.months.filter((_, i) => !allACMonths.has(i + 1));
+      const avgNonAC = nonACMonthValues.length > 0
+        ? nonACMonthValues.reduce((s, v) => s + v, 0) / nonACMonthValues.length
+        : 0;
+
+      const monthlyAC_EUIList: number[] = [];
+      let annualAC_EUI = 0;
+      for (let m = 0; m < 12; m++) {
+        const monthACEnergy = Math.max(0, (data.months[m] || 0) - avgNonAC);
+        const acEUI = projectForm.building_area > 0 ? monthACEnergy / projectForm.building_area : 0;
+        monthlyAC_EUIList.push(Math.round(acEUI * 100) / 100);
+        annualAC_EUI += monthACEnergy / projectForm.building_area;
+      }
+      annualAC_EUI = Math.round(annualAC_EUI * 100) / 100;
+
       return supabase.from('annual_energy').insert({
         project_id: projectData.id,
         year: data.year,
@@ -438,12 +1164,17 @@ function App() {
         month_9: data.months[8], month_10: data.months[9],
         month_11: data.months[10], month_12: data.months[11],
         unit: data.unit,
+        annual_eui: annualEUI, // 存储预计算的 EUI
+        annual_ac_eui: annualAC_EUI, // 存储空调EUI
+        monthly_ac_eui: monthlyAC_EUIList, // 存储月度空调EUI数组
       });
     });
 
     await Promise.all(insertPromises);
 
     alert('保存成功！');
+    clearCache('projects');
+    clearCache('project_euis');
     loadProjects();
     setActiveTab('home');
     resetForm();
@@ -453,10 +1184,29 @@ function App() {
     setProjectForm({ project_name: '', province: '', city: '', building_type: '', climate_zone: '', building_area: 0, is_public: true });
     setAnnualData([{ year: new Date().getFullYear(), months: Array(12).fill(0), unit: 'kWh' }]);
     setSelectedYearIndex(0);
-    setAcType('水冷冷水机组');
+    setAcMode('both');
+    setAcTypes(['水冷冷水机组']);
     setCoolingMonths([5, 6, 7, 8, 9]);
     setHeatingMonths([11, 12, 1, 2, 3]);
     setSelectedProject(null);
+    setScopData({
+      lowLoad: {
+        coolingLoad: 0,
+        chillerCount: 1,
+        chillers: [{ id: '1', name: '主机1', ratedPower: 0, frequency: 50 }],
+        chilledPump: { ratedPower: 0, frequency: 50 },
+        coolingPump: { ratedPower: 0, frequency: 50 },
+        coolingTower: { ratedPower: 0, frequency: 50 },
+      },
+      highLoad: {
+        coolingLoad: 0,
+        chillerCount: 1,
+        chillers: [{ id: '1', name: '主机1', ratedPower: 0, frequency: 50 }],
+        chilledPump: { ratedPower: 0, frequency: 50 },
+        coolingPump: { ratedPower: 0, frequency: 50 },
+        coolingTower: { ratedPower: 0, frequency: 50 },
+      },
+    });
   };
 
   // 编辑项目
@@ -473,9 +1223,11 @@ function App() {
       is_public: project.is_public,
     });
     // 加载项目编辑数据
-    if (project.ac_type) setAcType(project.ac_type);
+    if (project.ac_mode) setAcMode(project.ac_mode as 'cooling_only' | 'heating_only' | 'both');
+    if (project.ac_type) setAcTypes(project.ac_type.split(',').filter(Boolean));
     if (project.cooling_months) setCoolingMonths(project.cooling_months);
     if (project.heating_months) setHeatingMonths(project.heating_months);
+    if (project.scop_data) setScopData(project.scop_data as ScopData);
 
     // 从 annual_energy 表加载所有年度数据
     const { data: annualRecords } = await supabase.from('annual_energy').select('*').eq('project_id', project.id).order('year', { ascending: true });
@@ -505,6 +1257,8 @@ function App() {
 
     await supabase.from('annual_energy').delete().eq('project_id', project.id);
     await supabase.from('projects').delete().eq('id', project.id);
+    clearCache('projects');
+    clearCache('project_euis');
     loadProjects();
   };
 
@@ -523,10 +1277,12 @@ function App() {
       building_type: projectForm.building_type,
       climate_zone: projectForm.climate_zone,
       building_area: projectForm.building_area,
-      ac_type: acType,
+      ac_mode: acMode,
+      ac_type: acTypes.join(','),
       cooling_months: coolingMonths,
       heating_months: heatingMonths,
       is_public: projectForm.is_public,
+      scop_data: scopData as any,
     }).eq('id', selectedProject.id);
 
     // 删除旧的年度数据，重新插入所有年度数据
@@ -536,6 +1292,30 @@ function App() {
     const insertPromises = annualData.map(data => {
       const hasData = data.months.some(m => m > 0);
       if (!hasData) return Promise.resolve();
+
+      // 计算年度总能耗
+      const totalEnergy = data.months.reduce((sum, m) => sum + (m || 0), 0);
+      // 计算年度 EUI = 总能耗 / 建筑面积
+      const annualEUI = projectForm.building_area > 0 ? Math.round((totalEnergy / projectForm.building_area) * 100) / 100 : null;
+
+      // 计算月度空调EUI（与loadACStats一致的算法）
+      // 基准能耗 = 非冷热月的能耗平均值
+      // 月度空调EUI = max(0, 月度能耗 - 基准能耗) / 建筑面积
+      const allACMonths = new Set([...coolingMonths, ...heatingMonths]);
+      const nonACMonthValues = data.months.filter((_, i) => !allACMonths.has(i + 1));
+      const avgNonAC = nonACMonthValues.length > 0
+        ? nonACMonthValues.reduce((s, v) => s + v, 0) / nonACMonthValues.length
+        : 0;
+
+      const monthlyAC_EUIList: number[] = [];
+      let annualAC_EUI = 0;
+      for (let m = 0; m < 12; m++) {
+        const monthACEnergy = Math.max(0, (data.months[m] || 0) - avgNonAC);
+        const acEUI = projectForm.building_area > 0 ? monthACEnergy / projectForm.building_area : 0;
+        monthlyAC_EUIList.push(Math.round(acEUI * 100) / 100);
+        annualAC_EUI += monthACEnergy / projectForm.building_area;
+      }
+      annualAC_EUI = Math.round(annualAC_EUI * 100) / 100;
 
       return supabase.from('annual_energy').insert({
         project_id: selectedProject.id,
@@ -547,12 +1327,17 @@ function App() {
         month_9: data.months[8], month_10: data.months[9],
         month_11: data.months[10], month_12: data.months[11],
         unit: data.unit,
+        annual_eui: annualEUI, // 存储预计算的 EUI
+        annual_ac_eui: annualAC_EUI, // 存储空调EUI
+        monthly_ac_eui: monthlyAC_EUIList, // 存储月度空调EUI数组
       });
     });
 
     await Promise.all(insertPromises);
 
     alert('更新成功！');
+    clearCache('projects');
+    clearCache('project_euis');
     loadProjects();
     setActiveTab('home');
     resetForm();
@@ -627,36 +1412,24 @@ function App() {
 
   // 登录页面
   if (!user || view === 'login') {
-    return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
-          <div className="text-center mb-8">
-            <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg">
-              <Zap className="w-8 h-8 text-white" />
-            </div>
-            <h1 className="text-2xl font-bold text-gray-800">建筑能耗分析工具</h1>
-            <p className="text-gray-500 mt-2">智能分析 · 节能降耗 · 绿色建筑</p>
-          </div>
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">邮箱</label>
-              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
-                className="w-full px-4 py-3 rounded-xl border border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none"
-                placeholder="your@email.com" required />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">密码</label>
-              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
-                className="w-full px-4 py-3 rounded-xl border border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none"
-                placeholder="••••••••" required />
-            </div>
-            {authError && <p className="text-red-500 text-sm bg-red-50 p-3 rounded-lg">{authError}</p>}
-            <button type="submit" className="w-full py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:opacity-90 transition">
-              登录 / 注册
-            </button>
-          </form>
-          <p className="text-center text-gray-500 text-sm mt-6">首次使用将自动创建账号</p>
-        </div>
+        <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 px-4 py-2 flex justify-around">
+          <button onClick={() => { setView('dashboard'); setActiveTab('home'); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'home' ? 'text-blue-600' : 'text-gray-400'}`}>
+            <Home className="w-5 h-5" />
+            <span className="text-xs mt-1">首页</span>
+          </button>
+          <button onClick={() => { setView('project-form'); setActiveTab('input'); resetForm(); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}>
+            <FileText className="w-5 h-5" />
+            <span className="text-xs mt-1">录入</span>
+          </button>
+          <button onClick={() => setView('analysis')} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'analysis' ? 'text-blue-600' : 'text-gray-400'}`}>
+            <BarChart3 className="w-5 h-5" />
+            <span className="text-xs mt-1">分析</span>
+          </button>
+          <button onClick={() => setActiveTab('profile')} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'profile' ? 'text-blue-600' : 'text-gray-400'}`}>
+            <UserCircle className="w-5 h-5" />
+            <span className="text-xs mt-1">我的</span>
+          </button>
+        </nav>
       </div>
     );
   }
@@ -667,28 +1440,37 @@ function App() {
     const currentYearData = annualData[selectedYearIndex] || { months: Array(12).fill(0) };
     const beforeTotal = currentYearData.months.reduce((sum, val) => sum + (val || 0), 0);
     const beforeEUI = calculateEUI(beforeTotal, project.building_area);
-    const efficiency = calculateEfficiencyIndex(beforeEUI, project.building_type);
     const benchmark = getMatchingBenchmark(project);
+
+    // 使用实际同类项目数据（从数据库计算）替代benchmark固定值
+    const hasPeerData = peerStats.count > 0;
+    const displayAvgEUI = hasPeerData ? peerStats.avgEUI : (benchmark?.standard_eui || 80);
+    const displayMinEUI = hasPeerData ? peerStats.minEUI : (benchmark?.min_eui || 60);
+    const displayMaxEUI = hasPeerData ? peerStats.maxEUI : (benchmark?.max_eui || 120);
+
+    // 计算能效等级（基于实际同类项目数据）
+    const calculateEfficiencyWithPeer = (projectEUI: number) => {
+      if (!hasPeerData) {
+        return calculateEfficiencyIndex(projectEUI, project.building_type);
+      }
+      const ratio = projectEUI / peerStats.avgEUI;
+      if (ratio <= 0.8) return { percent: 90, level: '优秀', color: 'text-green-600' };
+      if (ratio <= 1.0) return { percent: 60, level: '良好', color: 'text-blue-600' };
+      if (ratio <= 1.2) return { percent: 40, level: '中等', color: 'text-yellow-600' };
+      return { percent: 20, level: '需改善', color: 'text-red-600' };
+    };
+    const efficiency = calculateEfficiencyWithPeer(beforeEUI);
 
     const trendResult = generateMonthlyTrendData();
     const trendData = trendResult.chartData;
     const pieData = energyCategories.map(c => ({ name: c.name, value: c.value, color: c.color }));
 
-    // 月度EUI分配比例（基于典型办公楼能耗分布）
-    const monthlyRatios = [0.08, 0.07, 0.08, 0.08, 0.09, 0.10, 0.10, 0.10, 0.09, 0.08, 0.07, 0.06];
-
     // 构建包含同类均值的图表数据
-    // 如果有同行数据用同行数据，否则用benchmark标准EUI按月分配
     const chartDataWithPeer = trendData.map((dataPoint: any, idx: number) => {
-      let peerEUI = peerMonthlyEUI[idx];
-      // 如果没有同行数据，使用benchmark标准EUI按月分配
-      if (!peerEUI || peerEUI === 0) {
-        const standardEUI = benchmark?.standard_eui || 60;
-        peerEUI = Math.round(standardEUI * monthlyRatios[idx] * 100) / 100;
-      }
       return {
         ...dataPoint,
-        '同类均值': peerEUI
+        '同类均值': peerMonthlyData[idx] > 0 ? peerMonthlyData[idx] : null,
+        '同类最佳': bestPeerMonthlyData[idx] > 0 ? bestPeerMonthlyData[idx] : null
       };
     });
 
@@ -741,44 +1523,40 @@ function App() {
             </div>
           </div>
 
-          {/* 同类平均EUI对比 */}
-          {benchmark && (
-            <div className="bg-white rounded-xl p-4 shadow-sm">
-              <h3 className="font-bold text-gray-800 mb-4 flex items-center gap-2">
-                <BarChart3 className="w-5 h-5 text-purple-500" />
-                与同类建筑EUI对比
-              </h3>
-              <div className="h-48">
-                <ResponsiveContainer width="100%" height="100%">
-                  <BarChart data={[
-                    { name: '本项目', value: beforeEUI },
-                    { name: '同类平均', value: benchmark.standard_eui },
-                    { name: '同类优秀', value: benchmark.min_eui },
-                    { name: '同类较差', value: benchmark.max_eui },
-                  ]} layout="vertical" margin={{ left: 20, right: 20 }}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-                    <XAxis type="number" tick={{ fontSize: 11 }} unit=" kWh/m²" />
-                    <YAxis type="category" dataKey="name" tick={{ fontSize: 12 }} width={80} />
-                    <Tooltip formatter={(value: number) => [`${value.toFixed(2)} kWh/m²`]} />
-                    <Bar dataKey="value" radius={[4, 4, 4, 4]}>
-                      <Cell fill="#3b82f6" />
-                      <Cell fill="#94a3b8" />
-                      <Cell fill="#22c55e" />
-                      <Cell fill="#ef4444" />
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-              <div className="mt-3 flex items-center justify-center gap-6 text-sm">
-                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-500"></span> 本项目</span>
-                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-gray-400"></span> 同类平均</span>
-                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-green-500"></span> 同类优秀</span>
-                <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-500"></span> 同类较差</span>
-              </div>
+          {/* 同类建筑EUI对比（使用实际计算的同类项目数据） */}
+          <div className="bg-white rounded-xl p-4 shadow-sm">
+            <h3 className="font-bold text-gray-800 mb-4 flex items-center gap-2">
+              <BarChart3 className="w-5 h-5 text-purple-500" />
+              与同类建筑EUI对比 {hasPeerData && <span className="text-xs text-gray-500">（{peerStats.count}个同类项目数据）</span>}
+            </h3>
+            <div className="h-48">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={[
+                  { name: '本项目', value: beforeEUI },
+                  { name: '同类平均', value: displayAvgEUI },
+                  { name: '同类优秀', value: displayMinEUI },
+                  { name: '同类较差', value: displayMaxEUI },
+                ]} layout="vertical" margin={{ left: 20, right: 20 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
+                  <XAxis type="number" tick={{ fontSize: 11 }} unit=" kWh/m²" />
+                  <YAxis type="category" dataKey="name" tick={{ fontSize: 12 }} width={80} />
+                  <Tooltip formatter={(value: number) => [`${value.toFixed(2)} kWh/m²`]} />
+                  <Bar dataKey="value" radius={[4, 4, 4, 4]}>
+                    <Cell fill="#3b82f6" />
+                    <Cell fill="#94a3b8" />
+                    <Cell fill="#22c55e" />
+                    <Cell fill="#ef4444" />
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
-          )}
-
-          {/* 月度趋势对比 */}
+            <div className="mt-3 flex items-center justify-center gap-6 text-sm">
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-blue-500"></span> 本项目</span>
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-gray-400"></span> 同类平均</span>
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-green-500"></span> 同类优秀</span>
+              <span className="flex items-center gap-1"><span className="w-3 h-3 rounded bg-red-500"></span> 同类较差</span>
+            </div>
+          </div>
           <div className="bg-white rounded-xl p-4 shadow-sm">
             <h3 className="font-bold text-gray-800 mb-4 flex items-center gap-2">
               <TrendingUp className="w-5 h-5 text-blue-500" />
@@ -786,15 +1564,15 @@ function App() {
             </h3>
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
-                <BarChart data={chartDataWithPeer} barCategoryGap="5%" barGap={2}>
+                <ComposedChart data={chartDataWithPeer} barCategoryGap="5%" barGap={2}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
                   <XAxis dataKey="month" tick={{ fontSize: 10 }} />
                   <YAxis tick={{ fontSize: 10 }} unit=" kWh/m²" />
                   <Tooltip formatter={(value: number, name: string) => {
-                    if (name === '同类均值') return [`${value.toFixed(2)} kWh/m² (同类均值)`];
-                    return [`${value.toFixed(2)} kWh/m²`];
+                    if (name === '同类均值') return [`${value?.toFixed(2) || 0} kWh/m² (同类均值)`];
+                    if (name === '同类最佳') return [`${value?.toFixed(2) || 0} kWh/m² (同类最佳)`];
+                    return [`${value?.toFixed(2) || 0} kWh/m²`];
                   }} />
-                  <Legend />
                   {trendYears.map((year) => (
                     <Bar
                       key={year}
@@ -811,7 +1589,15 @@ function App() {
                     dot={{ r: 3 }}
                     connectNulls
                   />
-                </BarChart>
+                  <Line
+                    type="monotone"
+                    dataKey="同类最佳"
+                    stroke="#22c55e"
+                    strokeWidth={2}
+                    dot={{ r: 3, fill: '#22c55e' }}
+                    connectNulls
+                  />
+                </ComposedChart>
               </ResponsiveContainer>
             </div>
             <div className="mt-2 flex items-center justify-center gap-4 text-xs text-gray-500">
@@ -825,71 +1611,110 @@ function App() {
                 <span className="w-3 h-0.5 border-t-2 border-dashed border-gray-400"></span>
                 同类均值
               </span>
+              <span className="flex items-center gap-1">
+                <span className="w-3 h-0.5 border-t-2 border-green-500"></span>
+                同类最佳
+              </span>
             </div>
           </div>
 
-          {/* 分类能耗占比 */}
+          {/* 空调月度EUI柱状图 */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="bg-white rounded-xl p-4 shadow-sm">
-              <h3 className="font-bold text-gray-800 mb-2">分类能耗占比</h3>
+              <h3 className="font-bold text-gray-800 mb-2">空调月度EUI</h3>
               <p className="text-xs text-gray-500 mb-3">
-                {selectedProject?.ac_type === 'central' ? '✓ 空调可估算（基于冷热月），其他分项无法估算' : '✗ 仅空调占比估算，其他分项无法区分'}
+                年度空调EUI: <span className="font-bold text-blue-600">{acStats.annualAC_EUI.toFixed(2)}</span> kWh/m²
               </p>
               <div className="h-48">
                 <ResponsiveContainer width="100%" height="100%">
-                  <PieChart>
-                    <Pie data={pieData} cx="50%" cy="50%" innerRadius={50} outerRadius={70} paddingAngle={2} dataKey="value">
-                      {pieData.map((entry, index) => <Cell key={`cell-${index}`} fill={entry.color} />)}
-                    </Pie>
-                    <Tooltip formatter={(value: number) => `${value.toLocaleString()} kWh`} />
-                    <Legend />
-                  </PieChart>
+                  <BarChart data={MONTHS.map((m, i) => ({ name: m.label, value: acMonthlyEUI[i] || 0 }))}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                    <YAxis tick={{ fontSize: 10 }} />
+                    <Tooltip formatter={(value: number) => `${value.toFixed(2)} kWh/m²`} />
+                    <Bar dataKey="value" fill="#3b82f6" name="空调EUI" />
+                  </BarChart>
                 </ResponsiveContainer>
               </div>
             </div>
 
             <div className="bg-white rounded-xl p-4 shadow-sm">
-              <h3 className="font-bold text-gray-800 mb-4">分项能耗详情</h3>
-              <div className="space-y-3">
-                {energyCategories.map((cat, i) => (
-                  <div key={i} className="flex items-center justify-between p-2 bg-gray-50 rounded-lg">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-lg flex items-center justify-center" style={{ backgroundColor: cat.color + '20', color: cat.color }}>
-                        {getCategoryIcon(cat.icon)}
-                      </div>
-                      <span className="font-medium">{cat.name}</span>
-                    </div>
-                    <div className="text-right">
-                      <p className="font-bold" style={{ color: cat.color }}>{cat.value.toLocaleString()} kWh</p>
-                      <p className="text-xs text-gray-500">{((cat.value / beforeTotal) * 100).toFixed(0)}%</p>
-                    </div>
+              <h3 className="font-bold text-gray-800 mb-4">空调节能空间分析</h3>
+              <div className="space-y-4">
+                <div className="flex items-center justify-between p-3 bg-blue-50 rounded-lg">
+                  <span className="text-gray-600">您的空调EUI</span>
+                  <span className="font-bold text-blue-600 text-lg">{acStats.annualAC_EUI.toFixed(2)} kWh/m²</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-green-50 rounded-lg">
+                  <span className="text-gray-600">同类平均空调EUI</span>
+                  <span className="font-bold text-green-600 text-lg">{acStats.avgPeerAC_EUI.toFixed(2)} kWh/m²</span>
+                </div>
+                <div className="flex items-center justify-between p-3 bg-amber-50 rounded-lg">
+                  <span className="text-gray-600">同类最佳空调EUI</span>
+                  <span className="font-bold text-amber-600 text-lg">{acStats.bestPeerAC_EUI.toFixed(2)} kWh/m²</span>
+                </div>
+                {acStats.energySavingPotential > 0 ? (
+                  <div className="p-4 bg-red-50 rounded-lg border border-red-200">
+                    <p className="text-sm text-gray-600 mb-2">节能空间</p>
+                    <p className="text-2xl font-bold text-red-600">{acStats.energySavingPotential}%</p>
+                    <p className="text-sm text-gray-500 mt-1">
+                      预计年节约: <span className="font-bold text-red-600">{acStats.energySavingAmount.toFixed(2)}</span> 万元
+                    </p>
+                    <p className="text-xs text-gray-400 mt-2">（基于电价1元/kWh估算）</p>
                   </div>
-                ))}
+                ) : (
+                  <div className="p-4 bg-gray-50 rounded-lg">
+                    <p className="text-center text-gray-500">
+                      <span className="text-xl">🎉</span><br />
+                      您的空调能效已达到同类优秀水平
+                    </p>
+                  </div>
+                )}
               </div>
             </div>
           </div>
 
-          {/* 基准对比 */}
-          {benchmark && (
+          {/* 与同类建筑EUI对比（进度条形式） */}
+          <div className="bg-white rounded-xl p-4 shadow-sm">
+            <h3 className="font-bold text-gray-800 mb-4 flex items-center gap-2">
+              <Target className="w-5 h-5 text-blue-500" />
+              与同类建筑EUI对比 {hasPeerData && <span className="text-xs text-gray-500">（基于{peerStats.count}个同类项目）</span>}
+            </h3>
+            <div className="flex items-center gap-6">
+              <div className="flex-1">
+                <div className="flex justify-between text-sm mb-1">
+                  <span>您的项目</span>
+                  <span className="font-bold">{beforeEUI.toFixed(2)} kWh/m²</span>
+                </div>
+                <div className="h-4 bg-gray-100 rounded-full overflow-hidden">
+                  <div className={`h-full rounded-full ${beforeEUI <= displayAvgEUI ? 'bg-green-500' : 'bg-red-500'}`}
+                    style={{ width: `${Math.min(100, (beforeEUI / (displayMaxEUI || 200)) * 100)}%` }}></div>
+                </div>
+              </div>
+              <div className="text-center px-4 border-l">
+                <p className="text-xs text-gray-500">同类平均</p>
+                <p className="text-lg font-bold text-gray-700">{displayAvgEUI.toFixed(1)}</p>
+              </div>
+            </div>
+          </div>
+
+          {/* SCOP 系统能效展示 */}
+          {project.scop_data && (
             <div className="bg-white rounded-xl p-4 shadow-sm">
               <h3 className="font-bold text-gray-800 mb-4 flex items-center gap-2">
-                <Target className="w-5 h-5 text-blue-500" />
-                与标准EUI对比
+                <Calculator className="w-5 h-5 text-green-500" />
+                SCOP 系统能效
               </h3>
-              <div className="flex items-center gap-6">
-                <div className="flex-1">
-                  <div className="flex justify-between text-sm mb-1">
-                    <span>您的项目</span>
-                    <span className="font-bold">{beforeEUI.toFixed(2)} kWh/m²</span>
-                  </div>
-                  <div className="h-4 bg-gray-100 rounded-full overflow-hidden">
-                    <div className={`h-full rounded-full ${beforeEUI <= benchmark.standard_eui ? 'bg-green-500' : 'bg-red-500'}`}
-                      style={{ width: `${Math.min(100, (beforeEUI / (benchmark.max_eui || 200)) * 100)}%` }}></div>
-                  </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div className="p-4 bg-blue-50 rounded-lg">
+                  <p className="text-sm text-blue-600 mb-2">低负荷段 SCOP</p>
+                  <p className="text-3xl font-bold text-blue-600">{calculateScop(project.scop_data.lowLoad).toFixed(3)}</p>
+                  <p className="text-xs text-gray-500 mt-2">制冷量：{project.scop_data.lowLoad.coolingLoad} kW</p>
                 </div>
-                <div className="text-center px-4 border-l">
-                  <p className="text-xs text-gray-500">标准EUI</p>
-                  <p className="text-lg font-bold text-gray-700">{benchmark.standard_eui}</p>
+                <div className="p-4 bg-orange-50 rounded-lg">
+                  <p className="text-sm text-orange-600 mb-2">高负荷段 SCOP</p>
+                  <p className="text-3xl font-bold text-orange-600">{calculateScop(project.scop_data.highLoad).toFixed(3)}</p>
+                  <p className="text-xs text-gray-500 mt-2">制冷量：{project.scop_data.highLoad.coolingLoad} kW</p>
                 </div>
               </div>
             </div>
@@ -902,7 +1727,7 @@ function App() {
             <Home className="w-5 h-5" />
             <span className="text-xs mt-1">首页</span>
           </button>
-          <button onClick={() => { setView('project-form'); setActiveTab('input'); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}>
+          <button onClick={() => { setView('project-form'); setActiveTab('input'); resetForm(); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}>
             <FileText className="w-5 h-5" />
             <span className="text-xs mt-1">录入</span>
           </button>
@@ -1009,41 +1834,76 @@ function App() {
               空调与冷热月
             </h2>
             <div className="space-y-4">
+              {/* 空调运行模式 */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">空调形式</label>
-                <select value={acType} onChange={(e) => setAcType(e.target.value)}
-                  className="w-full px-3 py-2 rounded-lg border border-gray-300">
-                  {AC_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
-                </select>
+                <label className="block text-sm font-medium text-gray-700 mb-2">空调运行模式</label>
+                <div className="flex gap-2">
+                  <button type="button" onClick={() => setAcMode('cooling_only')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm transition ${acMode === 'cooling_only' ? 'bg-cyan-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                    单冷
+                  </button>
+                  <button type="button" onClick={() => setAcMode('heating_only')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm transition ${acMode === 'heating_only' ? 'bg-orange-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                    单热
+                  </button>
+                  <button type="button" onClick={() => setAcMode('both')}
+                    className={`flex-1 px-3 py-2 rounded-lg text-sm transition ${acMode === 'both' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                    冷热都有
+                  </button>
+                </div>
               </div>
+
+              {/* 空调形式（可多选） */}
               <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">供冷月份（可多选）</label>
+                <label className="block text-sm font-medium text-gray-700 mb-2">空调形式（可多选）</label>
                 <div className="flex flex-wrap gap-2">
-                  {MONTHS.map(m => (
-                    <button key={m.value} type="button"
+                  {AC_TYPES.map(t => (
+                    <button key={t.value} type="button"
                       onClick={() => {
-                        setCoolingMonths(prev => prev.includes(m.value) ? prev.filter(x => x !== m.value) : [...prev, m.value]);
+                        setAcTypes(prev => prev.includes(t.value) ? prev.filter(x => x !== t.value) : [...prev, t.value]);
                       }}
-                      className={`px-3 py-1 rounded-full text-sm transition ${coolingMonths.includes(m.value) ? 'bg-cyan-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
-                      {m.label}
+                      className={`px-3 py-1 rounded-full text-sm transition ${acTypes.includes(t.value) ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                      {t.label}
                     </button>
                   ))}
                 </div>
               </div>
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-2">供热月份（可多选）</label>
-                <div className="flex flex-wrap gap-2">
-                  {MONTHS.map(m => (
-                    <button key={m.value} type="button"
-                      onClick={() => {
-                        setHeatingMonths(prev => prev.includes(m.value) ? prev.filter(x => x !== m.value) : [...prev, m.value]);
-                      }}
-                      className={`px-3 py-1 rounded-full text-sm transition ${heatingMonths.includes(m.value) ? 'bg-orange-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
-                      {m.label}
-                    </button>
-                  ))}
+
+              {/* 供冷月份（仅单冷或冷热都有时显示） */}
+              {(acMode === 'cooling_only' || acMode === 'both') && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">供冷月份（可多选）</label>
+                  <div className="flex flex-wrap gap-2">
+                    {MONTHS.map(m => (
+                      <button key={m.value} type="button"
+                        onClick={() => {
+                          setCoolingMonths(prev => prev.includes(m.value) ? prev.filter(x => x !== m.value) : [...prev, m.value]);
+                        }}
+                        className={`px-3 py-1 rounded-full text-sm transition ${coolingMonths.includes(m.value) ? 'bg-cyan-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-              </div>
+              )}
+
+              {/* 供热月份（仅单热或冷热都有时显示） */}
+              {(acMode === 'heating_only' || acMode === 'both') && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">供热月份（可多选）</label>
+                  <div className="flex flex-wrap gap-2">
+                    {MONTHS.map(m => (
+                      <button key={m.value} type="button"
+                        onClick={() => {
+                          setHeatingMonths(prev => prev.includes(m.value) ? prev.filter(x => x !== m.value) : [...prev, m.value]);
+                        }}
+                        className={`px-3 py-1 rounded-full text-sm transition ${heatingMonths.includes(m.value) ? 'bg-orange-500 text-white' : 'bg-gray-100 text-gray-600 hover:bg-gray-200'}`}>
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           </div>
 
@@ -1147,6 +2007,216 @@ function App() {
             )}
           </div>
 
+          {/* SCOP 系统计算 */}
+          <div className="bg-white rounded-xl p-4 shadow-sm">
+            <h2 className="font-bold text-gray-800 mb-4 flex items-center gap-2">
+              <Calculator className="w-5 h-5 text-green-500" />
+              SCOP 系统能效计算
+            </h2>
+
+            {/* 低负荷段 */}
+            <div className="mb-6 p-4 bg-blue-50 rounded-lg">
+              <h3 className="font-medium text-blue-700 mb-3">低负荷段</h3>
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs text-gray-600 mb-1">制冷量 (kW)</label>
+                  <input type="number" value={scopData.lowLoad.coolingLoad || ''}
+                    onChange={(e) => setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, coolingLoad: parseFloat(e.target.value) || 0 } })}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-300 text-sm" placeholder="0" />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-gray-600 mb-1">主机数量</label>
+                  <input type="number" min="1" value={scopData.lowLoad.chillerCount}
+                    onChange={(e) => {
+                      const count = parseInt(e.target.value) || 1;
+                      const newChillers = Array.from({ length: count }, (_, i) => {
+                        const existing = scopData.lowLoad.chillers[i];
+                        return existing || { id: String(i + 1), name: `主机${i + 1}`, ratedPower: 0, frequency: 50 };
+                      });
+                      setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, chillerCount: count, chillers: newChillers } });
+                    }}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-300 text-sm" />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="block text-xs text-gray-600">主机功率 (kW) / 运行频率 (Hz)</label>
+                  {scopData.lowLoad.chillers.map((chiller, i) => (
+                    <div key={chiller.id} className="flex gap-2">
+                      <input type="number" value={chiller.ratedPower || ''}
+                        onChange={(e) => {
+                          const newChillers = [...scopData.lowLoad.chillers];
+                          newChillers[i] = { ...newChillers[i], ratedPower: parseFloat(e.target.value) || 0 };
+                          setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, chillers: newChillers } });
+                        }}
+                        className="flex-1 px-2 py-1 rounded border text-sm" placeholder="功率" />
+                      <input type="number" value={chiller.frequency || ''}
+                        onChange={(e) => {
+                          const newChillers = [...scopData.lowLoad.chillers];
+                          newChillers[i] = { ...newChillers[i], frequency: parseFloat(e.target.value) || 50 };
+                          setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, chillers: newChillers } });
+                        }}
+                        className="w-20 px-2 py-1 rounded border text-sm" placeholder="频率" />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷冻泵额定功率 (kW)</label>
+                    <input type="number" value={scopData.lowLoad.chilledPump.ratedPower || ''}
+                      onChange={(e) => setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, chilledPump: { ...scopData.lowLoad.chilledPump, ratedPower: parseFloat(e.target.value) || 0 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="0" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷冻泵运行频率 (Hz)</label>
+                    <input type="number" value={scopData.lowLoad.chilledPump.frequency || ''}
+                      onChange={(e) => setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, chilledPump: { ...scopData.lowLoad.chilledPump, frequency: parseFloat(e.target.value) || 50 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="50" />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却泵额定功率 (kW)</label>
+                    <input type="number" value={scopData.lowLoad.coolingPump.ratedPower || ''}
+                      onChange={(e) => setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, coolingPump: { ...scopData.lowLoad.coolingPump, ratedPower: parseFloat(e.target.value) || 0 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="0" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却泵运行频率 (Hz)</label>
+                    <input type="number" value={scopData.lowLoad.coolingPump.frequency || ''}
+                      onChange={(e) => setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, coolingPump: { ...scopData.lowLoad.coolingPump, frequency: parseFloat(e.target.value) || 50 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="50" />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却塔额定功率 (kW)</label>
+                    <input type="number" value={scopData.lowLoad.coolingTower.ratedPower || ''}
+                      onChange={(e) => setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, coolingTower: { ...scopData.lowLoad.coolingTower, ratedPower: parseFloat(e.target.value) || 0 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="0" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却塔运行频率 (Hz)</label>
+                    <input type="number" value={scopData.lowLoad.coolingTower.frequency || ''}
+                      onChange={(e) => setScopData({ ...scopData, lowLoad: { ...scopData.lowLoad, coolingTower: { ...scopData.lowLoad.coolingTower, frequency: parseFloat(e.target.value) || 50 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="50" />
+                  </div>
+                </div>
+
+                <div className="p-3 bg-white rounded border border-blue-200 mt-3">
+                  <div className="flex justify-between items-center">
+                    <span className="text-sm text-gray-600">低负荷段 SCOP：</span>
+                    <span className="text-xl font-bold text-blue-600">{calculateScop(scopData.lowLoad).toFixed(3)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* 高负荷段 */}
+            <div className="p-4 bg-orange-50 rounded-lg">
+              <h3 className="font-medium text-orange-700 mb-3">高负荷段</h3>
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs text-gray-600 mb-1">制冷量 (kW)</label>
+                  <input type="number" value={scopData.highLoad.coolingLoad || ''}
+                    onChange={(e) => setScopData({ ...scopData, highLoad: { ...scopData.highLoad, coolingLoad: parseFloat(e.target.value) || 0 } })}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-300 text-sm" placeholder="0" />
+                </div>
+
+                <div>
+                  <label className="block text-xs text-gray-600 mb-1">主机数量</label>
+                  <input type="number" min="1" value={scopData.highLoad.chillerCount}
+                    onChange={(e) => {
+                      const count = parseInt(e.target.value) || 1;
+                      const newChillers = Array.from({ length: count }, (_, i) => {
+                        const existing = scopData.highLoad.chillers[i];
+                        return existing || { id: String(i + 1), name: `主机${i + 1}`, ratedPower: 0, frequency: 50 };
+                      });
+                      setScopData({ ...scopData, highLoad: { ...scopData.highLoad, chillerCount: count, chillers: newChillers } });
+                    }}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-300 text-sm" />
+                </div>
+
+                <div className="space-y-2">
+                  <label className="block text-xs text-gray-600">主机功率 (kW) / 运行频率 (Hz)</label>
+                  {scopData.highLoad.chillers.map((chiller, i) => (
+                    <div key={chiller.id} className="flex gap-2">
+                      <input type="number" value={chiller.ratedPower || ''}
+                        onChange={(e) => {
+                          const newChillers = [...scopData.highLoad.chillers];
+                          newChillers[i] = { ...newChillers[i], ratedPower: parseFloat(e.target.value) || 0 };
+                          setScopData({ ...scopData, highLoad: { ...scopData.highLoad, chillers: newChillers } });
+                        }}
+                        className="flex-1 px-2 py-1 rounded border text-sm" placeholder="功率" />
+                      <input type="number" value={chiller.frequency || ''}
+                        onChange={(e) => {
+                          const newChillers = [...scopData.highLoad.chillers];
+                          newChillers[i] = { ...newChillers[i], frequency: parseFloat(e.target.value) || 50 };
+                          setScopData({ ...scopData, highLoad: { ...scopData.highLoad, chillers: newChillers } });
+                        }}
+                        className="w-20 px-2 py-1 rounded border text-sm" placeholder="频率" />
+                    </div>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷冻泵额定功率 (kW)</label>
+                    <input type="number" value={scopData.highLoad.chilledPump.ratedPower || ''}
+                      onChange={(e) => setScopData({ ...scopData, highLoad: { ...scopData.highLoad, chilledPump: { ...scopData.highLoad.chilledPump, ratedPower: parseFloat(e.target.value) || 0 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="0" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷冻泵运行频率 (Hz)</label>
+                    <input type="number" value={scopData.highLoad.chilledPump.frequency || ''}
+                      onChange={(e) => setScopData({ ...scopData, highLoad: { ...scopData.highLoad, chilledPump: { ...scopData.highLoad.chilledPump, frequency: parseFloat(e.target.value) || 50 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="50" />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却泵额定功率 (kW)</label>
+                    <input type="number" value={scopData.highLoad.coolingPump.ratedPower || ''}
+                      onChange={(e) => setScopData({ ...scopData, highLoad: { ...scopData.highLoad, coolingPump: { ...scopData.highLoad.coolingPump, ratedPower: parseFloat(e.target.value) || 0 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="0" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却泵运行频率 (Hz)</label>
+                    <input type="number" value={scopData.highLoad.coolingPump.frequency || ''}
+                      onChange={(e) => setScopData({ ...scopData, highLoad: { ...scopData.highLoad, coolingPump: { ...scopData.highLoad.coolingPump, frequency: parseFloat(e.target.value) || 50 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="50" />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却塔额定功率 (kW)</label>
+                    <input type="number" value={scopData.highLoad.coolingTower.ratedPower || ''}
+                      onChange={(e) => setScopData({ ...scopData, highLoad: { ...scopData.highLoad, coolingTower: { ...scopData.highLoad.coolingTower, ratedPower: parseFloat(e.target.value) || 0 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="0" />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-600 mb-1">冷却塔运行频率 (Hz)</label>
+                    <input type="number" value={scopData.highLoad.coolingTower.frequency || ''}
+                      onChange={(e) => setScopData({ ...scopData, highLoad: { ...scopData.highLoad, coolingTower: { ...scopData.highLoad.coolingTower, frequency: parseFloat(e.target.value) || 50 } } })}
+                      className="w-full px-2 py-1 rounded border text-sm" placeholder="50" />
+                  </div>
+                </div>
+
+                <div className="p-3 bg-white rounded border border-orange-200 mt-3">
+                  <div className="flex justify-between items-center">
+                    <span className="text-sm text-gray-600">高负荷段 SCOP：</span>
+                    <span className="text-xl font-bold text-orange-600">{calculateScop(scopData.highLoad).toFixed(3)}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <button onClick={selectedProject ? updateProject : saveProject} className="w-full py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-bold flex items-center justify-center gap-2">
             <Save className="w-5 h-5" />
             {selectedProject ? '更新项目' : '保存项目'}
@@ -1206,7 +2276,12 @@ function App() {
           <div className="bg-white rounded-xl p-3 shadow-sm">
             <p className="text-xs text-gray-500">平均EUI</p>
             <p className="text-2xl font-bold text-blue-600">
-              {projects.length > 0 ? (projects.reduce((s, p) => s + p.building_area, 0) / projects.length).toFixed(0) : 0}
+              {(() => {
+                const euis = Object.values(projectEUIs).filter(e => e > 0);
+                if (euis.length === 0) return '0';
+                const avg = euis.reduce((sum, e) => sum + e, 0) / euis.length;
+                return avg.toFixed(1);
+              })()}
             </p>
           </div>
           <div className="bg-white rounded-xl p-3 shadow-sm">
@@ -1220,7 +2295,7 @@ function App() {
         </div>
 
         {/* 快捷操作 */}
-        <button onClick={() => { setView('project-form'); setActiveTab('input'); }}
+        <button onClick={() => { setView('project-form'); setActiveTab('input'); resetForm(); }}
           className="w-full py-4 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg">
           <Plus className="w-5 h-5" />
           新建项目
@@ -1286,13 +2361,59 @@ function App() {
         </div>
       </main>
 
+      {/* Profile Tab Content */}
+      {activeTab === 'profile' && (
+        <div className="fixed inset-0 bg-gray-50 z-40 overflow-auto">
+          <div className="max-w-md mx-auto p-4 space-y-4">
+            {/* 用户信息卡片 */}
+            <div className="bg-white rounded-xl p-4 shadow-sm">
+              <h2 className="font-bold text-gray-800 mb-4">账号信息</h2>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-gray-500">邮箱</span>
+                  <span className="font-medium text-gray-800">{user?.email}</span>
+                </div>
+                {user?.full_name && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500">姓名</span>
+                    <span className="font-medium text-gray-800">{user.full_name}</span>
+                  </div>
+                )}
+                {user?.company && (
+                  <div className="flex items-center justify-between">
+                    <span className="text-gray-500">公司</span>
+                    <span className="font-medium text-gray-800">{user.company}</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* 管理员入口 */}
+            {isAdmin && (
+              <button onClick={() => setView('admin')}
+                className="w-full py-4 bg-gradient-to-r from-purple-500 to-indigo-600 text-white rounded-xl font-bold flex items-center justify-center gap-2 shadow-lg">
+                <User className="w-5 h-5" />
+                进入管理员面板
+              </button>
+            )}
+
+            {/* 登出按钮 */}
+            <button onClick={handleLogout}
+              className="w-full py-3 bg-white text-red-500 rounded-xl font-medium flex items-center justify-center gap-2 border border-red-200">
+              <LogOut className="w-5 h-5" />
+              退出登录
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 底部导航 */}
       <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 px-4 py-2 flex justify-around">
         <button onClick={() => setActiveTab('home')} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'home' ? 'text-blue-600' : 'text-gray-400'}`}>
           <Home className="w-5 h-5" />
           <span className="text-xs mt-1">首页</span>
         </button>
-        <button onClick={() => { setView('project-form'); setActiveTab('input'); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}>
+        <button onClick={() => { setView('project-form'); setActiveTab('input'); resetForm(); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}>
           <FileText className="w-5 h-5" />
           <span className="text-xs mt-1">录入</span>
         </button>

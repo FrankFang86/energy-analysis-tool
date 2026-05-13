@@ -3,7 +3,19 @@ import { createClient } from '@supabase/supabase-js';
 const supabaseUrl = 'https://hhoqiozrkskuicgiqdkh.supabase.co';
 const supabaseAnonKey = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhob3Fpb3pya3NrdWljZ2lxZGtoIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc4MDU1MDQsImV4cCI6MjA5MzM4MTUwNH0.7AGLr4IdfK42ADhFaJW0zb7BebMBdV7TySX9f6XNHWQ';
 
+// 服务角色密钥（用于管理员操作）- 请替换为实际的服务角色密钥
+const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imhob3Fpb3pya3NrdWljZ2lxZGtoIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NzgwNTUwNCwiZXhwIjoyMDkzMzgxNTA0fQ.JIhKKKKKKKKKKKKKKKKKKKKKKKKKKKKK';
+
+// 创建普通客户端（用于前端操作，受RLS限制）
 export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// 创建服务角色客户端（用于管理员操作，绕过RLS）
+export const supabaseAdmin = createClient(supabaseUrl, SUPABASE_SERVICE_ROLE_KEY, {
+  auth: {
+    autoRefreshToken: false,
+    persistSession: false
+  }
+});
 
 // 工具函数
 export const formatNumber = (num: number, decimals = 2) => {

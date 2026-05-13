@@ -1,3 +1,14 @@
+---
+AIGC:
+    ContentProducer: Minimax Agent AI
+    ContentPropagator: Minimax Agent AI
+    Label: AIGC
+    ProduceID: "00000000000000000000000000000000"
+    PropagateID: "00000000000000000000000000000000"
+    ReservedCode1: 3046022100cfe54caead7a6514fcd4b7965c432b44d1cb1b437d2064dfb80303ed6d0bebea022100cafb7aec19ea52b8f5298851f0eb62ef1af9e1a4fb9d80eeb68609ddcdac6a21
+    ReservedCode2: 304402205c3f03974d8b1b1cebda2d16797d28df91a45b009de822a5c7d577e2dfa4feee022068b387bab04e1fdc562a15fc36a245ba2336bd10a9eebabec504b8b3bcafda2b
+---
+
 # React + TypeScript + Vite
 
 This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
