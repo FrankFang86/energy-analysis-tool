@@ -1412,24 +1412,36 @@ function App() {
 
   // 登录页面
   if (!user || view === 'login') {
-        <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 px-4 py-2 flex justify-around">
-          <button onClick={() => { setView('dashboard'); setActiveTab('home'); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'home' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <Home className="w-5 h-5" />
-            <span className="text-xs mt-1">首页</span>
-          </button>
-          <button onClick={() => { setView('project-form'); setActiveTab('input'); resetForm(); }} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'input' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <FileText className="w-5 h-5" />
-            <span className="text-xs mt-1">录入</span>
-          </button>
-          <button onClick={() => setView('analysis')} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'analysis' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <BarChart3 className="w-5 h-5" />
-            <span className="text-xs mt-1">分析</span>
-          </button>
-          <button onClick={() => setActiveTab('profile')} className={`flex flex-col items-center py-2 px-4 ${activeTab === 'profile' ? 'text-blue-600' : 'text-gray-400'}`}>
-            <UserCircle className="w-5 h-5" />
-            <span className="text-xs mt-1">我的</span>
-          </button>
-        </nav>
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 flex items-center justify-center p-4">
+        <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8">
+          <div className="text-center mb-8">
+            <div className="w-16 h-16 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-lg">
+              <Zap className="w-8 h-8 text-white" />
+            </div>
+            <h1 className="text-2xl font-bold text-gray-800">建筑能耗分析工具</h1>
+            <p className="text-gray-500 mt-2">智能分析 · 节能降耗 · 绿色建筑</p>
+          </div>
+          <form onSubmit={handleLogin} className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">邮箱</label>
+              <input type="email" value={email} onChange={(e) => setEmail(e.target.value)}
+                className="w-full px-4 py-3 rounded-xl border border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                placeholder="your@email.com" required />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">密码</label>
+              <input type="password" value={password} onChange={(e) => setPassword(e.target.value)}
+                className="w-full px-4 py-3 rounded-xl border border-gray-300 focus:ring-2 focus:ring-blue-500 outline-none"
+                placeholder="••••••••" required />
+            </div>
+            {authError && <p className="text-red-500 text-sm bg-red-50 p-3 rounded-lg">{authError}</p>}
+            <button type="submit" className="w-full py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:opacity-90 transition">
+              登录 / 注册
+            </button>
+          </form>
+          <p className="text-center text-gray-500 text-sm mt-6">首次使用将自动创建账号</p>
+        </div>
       </div>
     );
   }
